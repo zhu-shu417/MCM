@@ -1,0 +1,111 @@
+import math
+import pandas as pd
+import numpy as np
+
+# ===== 读取数据 =====
+xlsx_path = "/mnt/data/launch_costs.xlsx"
+csv_path = "/mnt/data/launch_forecast.csv"
+success_path = "/mnt/data/gpr_success_rate_2050_2300_high_low_mean_fillblank100 (1).xlsx"
+
+# 成本表
+cost_df = pd.read_excel(xlsx_path, sheet_name="costs_r2.5")
+per_launch_cost = dict(zip(cost_df["经纬度"], cost_df["单次燃料费用($)"]))
+
+# 中英文站名映射
+mapping = {
+    '阿拉斯加': 'Alaska',
+    '加利福尼亚': 'California',
+    '德克萨斯': 'Texas',
+    '佛罗里达': 'Florida',
+    '弗吉尼亚': 'Virginia',
+    '哈萨克斯坦': 'Kazakhstan',
+    '法属圭亚那': 'French Guiana',
+    '印度': 'Satish Dhawan Space Centre (India)',
+    '太原': 'Taiyuan Satellite Launch Center (China)',
+    '新西兰': 'Mahia Peninsula (New Zealand)'
+}
+
+# 发射次数预测表
+df_fore = pd.read_csv(csv_path)
+year_col = df_fore.columns[0]
+caps_yearly = df_fore.drop(columns=[year_col])
+years = df_fore[year_col].astype(int).to_numpy()
+
+# 成功率表
+xl_success = pd.ExcelFile(success_path)
+df_success = xl_success.parse("high_low_mean")
+mean_cols = [c for c in df_success.columns if "mean(%)" in c]
+df_mean = df_success[["Year"] + mean_cols].copy()
+df_mean.columns = ["Year"] + [c.replace(" mean(%)", "") for c in mean_cols]
+df_mean.set_index("Year", inplace=True)
+df_success_rate = df_mean / 100.0
+
+# 站名映射补全
+site_map = {
+    'Alaska': 'Alaska (USA)',
+    'California': 'California (USA)',
+    'Texas': 'Texas (USA)',
+    'Florida': 'Florida (USA)',
+    'Virginia': 'Virginia (USA)',
+    'Kazakhstan': 'Kazakhstan',
+    'French Guiana': 'French Guiana',
+    'Satish Dhawan Space Centre (India)': 'India (Satish Dhawan)',
+    'Taiyuan Satellite Launch Center (China)': 'China (Taiyuan)',
+    'Mahia Peninsula (New Zealand)': 'New Zealand (Mahia)'
+}
+
+# 成功率调整后的每年运输能力（吨）
+BASE_PAYLOAD_TON = 150.0
+caps_adjusted_tons = pd.DataFrame(index=caps_yearly.index, columns=caps_yearly.columns, dtype=float)
+for forecast_name, sr_name in site_map.items():
+    sr = df_success_rate[sr_name].reindex(df_fore[year_col].values).to_numpy()
+    launches = df_fore[forecast_name].to_numpy()
+    caps_adjusted_tons[forecast_name] = launches * BASE_PAYLOAD_TON * sr
+caps_adjusted_cumsum = caps_adjusted_tons.cumsum()
+
+# Mode-B 参数
+TOTAL_CARGO_TONS = 100_000_000
+MODEB_CAP_PER_YEAR_TONS = 3 * 179000
+MODEB_COST_PER_YEAR_USD = 1.7052727e7 / 0.8 + 2.3667e8
+rocket_costs = dict(zip(caps_adjusted_tons.columns, cost_df["单次燃料费用($)"]))
+
+def min_total_cost_with_successrate():
+    site_order = sorted(rocket_costs.keys(), key=lambda s: rocket_costs[s])
+    results = []
+    for i, y in enumerate(years):
+        yrs = i + 1
+        modeb_delivered = yrs * MODEB_CAP_PER_YEAR_TONS
+        modeb_cost = yrs * MODEB_COST_PER_YEAR_USD
+        remaining_tons = max(0.0, TOTAL_CARGO_TONS - modeb_delivered)
+        rocket_available = caps_adjusted_cumsum.iloc[i]
+        rocket_total_cap = rocket_available.sum()
+
+        if rocket_total_cap < remaining_tons:
+            results.append([y, False, np.inf, modeb_cost, np.nan, modeb_delivered, rocket_total_cap])
+            continue
+
+        rocket_used = 0.0
+        rocket_cost = 0.0
+        rem = remaining_tons
+        for site in site_order:
+            avail = rocket_available[site]
+            take = min(avail, rem)
+            rocket_cost += take / BASE_PAYLOAD_TON * rocket_costs[site]
+            rocket_used += take
+            rem -= take
+            if rem <= 0:
+                break
+
+        total_cost = modeb_cost + rocket_cost
+        results.append([y, True, total_cost, modeb_cost, rocket_cost, modeb_delivered, rocket_used])
+
+    return pd.DataFrame(results, columns=[
+        "year", "can_finish", "total_min_cost_usd",
+        "modeb_cost_usd", "rocket_cost_usd",
+        "modeb_delivered_tons", "rocket_delivered_tons"
+    ])
+
+# 运行
+result_df = min_total_cost_with_successrate()
+result_df.to_csv("/mnt/data/final_cost_by_year.csv", index=False)
+print("✅ 分析完成，结果已保存为 final_cost_by_year.csv")
